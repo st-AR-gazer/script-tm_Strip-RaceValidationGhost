@@ -1,0 +1,9 @@
+bin/
+obj/
+
+.vs/
+
+processed/
+e2e-output/
+
+publish/
