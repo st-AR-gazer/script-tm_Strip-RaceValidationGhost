@@ -1,5 +1,6 @@
 using System;
 using System.Diagnostics;
+using System.Diagnostics.CodeAnalysis;
 using System.IO;
 using System.Reflection;
 using System.Text;
@@ -70,12 +71,23 @@ namespace StripValidationReplay
                 var map = gbx.Node;
                 var validationGhost = map.ChallengeParameters?.RaceValidateGhost;
                 var hadGhost = validationGhost is not null;
+                var hadClones = map.HasClones;
+
+                if (hadClones && options.CloneHandling == CloneHandling.Block)
+                {
+                    PrintClonesEnabledError();
+                    return 5;
+                }
 
                 if (hadGhost)
                     AddRemovalMetadata(map);
 
                 if (map.ChallengeParameters is not null)
                     map.ChallengeParameters.RaceValidateGhost = null;
+
+                var removedCloneState = hadClones && options.CloneHandling == CloneHandling.RemoveCloneState;
+                if (removedCloneState)
+                    map.HasClones = false;
 
                 if (!string.IsNullOrWhiteSpace(note))
                     map.Comments = AppendNote(map.Comments, note);
@@ -84,6 +96,9 @@ namespace StripValidationReplay
                 var write = new GbxWriteSettings();
                 ForceUncompressed(write);
                 gbx.Save(uncompressedOut, write);
+
+                if (removedCloneState)
+                    PatchHeaderHasClonesFlag(uncompressedOut);
 
                 RunGbxlzo(gbxlzoPath, uncompressedOut, outputPath, decompress: false);
 
@@ -108,6 +123,7 @@ namespace StripValidationReplay
                 var returnedReplayPath = CopyReturnArtifact(options.ReturnReplayDirectory, replayLogPath);
 
                 Console.WriteLine($"Validation replay removed: {hadGhost}");
+                Console.WriteLine($"Clone state removed: {removedCloneState}");
                 Console.WriteLine($"Saved: {outputPath}");
                 Console.WriteLine($"Logged map: {mapLogPath}");
                 Console.WriteLine($"Logged ghost: {ghostLogPath ?? "(none)"}");
@@ -140,12 +156,17 @@ namespace StripValidationReplay
         private static void PrintUsage()
         {
             Console.WriteLine("Usage:");
-            Console.WriteLine(@"  stripValidationReplay.exe ""<input.Map.Gbx>"" ""<output.Map.Gbx>"" [""optional note""] [--return-map ""<folder>""] [--return-ghost ""<folder>""] [--return-replay ""<folder>""]");
+            Console.WriteLine(@"  stripValidationReplay.exe ""<input.Map.Gbx>"" ""<output.Map.Gbx>"" [""optional note""] [--allow-clones [remove|keep]] [--return-map ""<folder>""] [--return-ghost ""<folder>""] [--return-replay ""<folder>""]");
             Console.WriteLine();
             Console.WriteLine("Optional note:");
             Console.WriteLine(@"  - Pass a note as the 3rd argument, or set TM_NOTE.");
             Console.WriteLine(@"  - Set TM_ADD_NOTE=true to append a default note.");
             Console.WriteLine(@"  - Set TM_META_KEY to override the metadata key (default: LibMapType_Extra).");
+            Console.WriteLine();
+            Console.WriteLine("Clone safety:");
+            Console.WriteLine(@"  - Clone-enabled maps are refused by default.");
+            Console.WriteLine(@"  - --allow-clones remove  Allow stripping and clear CGameCtnChallenge.HasClones plus header XML hasclones. This is the default state when --allow-clones is passed without a state.");
+            Console.WriteLine(@"  - --allow-clones keep    Allow stripping but keep the map clone state untouched.");
             Console.WriteLine();
             Console.WriteLine("Return options:");
             Console.WriteLine(@"  - --return-map ""<folder>""    Copy cleaned map to this folder.");
@@ -160,6 +181,13 @@ namespace StripValidationReplay
             Console.WriteLine();
             Console.WriteLine("Dependencies:");
             Console.WriteLine(@"  - gbxlzo.exe must be next to this exe or set GBXLZO_PATH.");
+        }
+
+        private static void PrintClonesEnabledError()
+        {
+            Console.WriteLine("Refusing to remove validation replay: this map has clones enabled.");
+            Console.WriteLine(@"Use --allow-clones remove to strip the validation replay and clear CGameCtnChallenge.HasClones plus the header XML hasclones flag.");
+            Console.WriteLine(@"Use --allow-clones keep to strip only the validation replay and leave the clone state enabled.");
         }
 
         private static CliOptions ParseArguments(string[] args)
@@ -180,6 +208,7 @@ namespace StripValidationReplay
             string? returnMapDirectory = null;
             string? returnGhostDirectory = null;
             string? returnReplayDirectory = null;
+            var cloneHandling = CloneHandling.Block;
 
             for (var i = 2; i < args.Length; i++)
             {
@@ -205,6 +234,26 @@ namespace StripValidationReplay
                     continue;
                 }
 
+                if (arg.StartsWith("--allow-clones=", StringComparison.OrdinalIgnoreCase))
+                {
+                    var value = arg["--allow-clones=".Length..].Trim();
+                    cloneHandling = SetCloneHandling(cloneHandling, ParseCloneHandlingValue(value, "--allow-clones"));
+                    continue;
+                }
+
+                if (string.Equals(arg, "--allow-clones", StringComparison.OrdinalIgnoreCase))
+                {
+                    var handling = CloneHandling.RemoveCloneState;
+                    if (i + 1 < args.Length && !args[i + 1].Trim().StartsWith("--", StringComparison.Ordinal))
+                    {
+                        handling = ParseCloneHandlingValue(args[i + 1].Trim(), arg);
+                        i++;
+                    }
+
+                    cloneHandling = SetCloneHandling(cloneHandling, handling);
+                    continue;
+                }
+
                 if (arg.StartsWith("--", StringComparison.Ordinal))
                     throw new CliArgumentException($"Unknown option: {arg}");
 
@@ -222,8 +271,28 @@ namespace StripValidationReplay
                 noteArgument,
                 returnMapDirectory,
                 returnGhostDirectory,
-                returnReplayDirectory
+                returnReplayDirectory,
+                cloneHandling
             );
+        }
+
+        private static CloneHandling SetCloneHandling(CloneHandling current, CloneHandling next)
+        {
+            if (current != CloneHandling.Block)
+                throw new CliArgumentException("--allow-clones was specified more than once.");
+
+            return next;
+        }
+
+        private static CloneHandling ParseCloneHandlingValue(string value, string optionName)
+        {
+            if (string.Equals(value, "remove", StringComparison.OrdinalIgnoreCase))
+                return CloneHandling.RemoveCloneState;
+
+            if (string.Equals(value, "keep", StringComparison.OrdinalIgnoreCase))
+                return CloneHandling.KeepCloneState;
+
+            throw new CliArgumentException($"Invalid value for {optionName}: {value}. Expected remove or keep.");
         }
 
         private static string ReadOptionValue(string[] args, ref int i, string optionName)
@@ -288,6 +357,48 @@ namespace StripValidationReplay
 
             RunGbxlzo(gbxlzoPath, ghostUncompressedPath, ghostLogPath, decompress: false);
             return ghostLogPath;
+        }
+
+        private static void PatchHeaderHasClonesFlag(string mapPath)
+        {
+            var bytes = File.ReadAllBytes(mapPath);
+            var patched = ReplaceAscii(bytes, @"hasclones=""1""", @"hasclones=""0""");
+            patched |= ReplaceAscii(bytes, "hasclones='1'", "hasclones='0'");
+
+            if (patched)
+                File.WriteAllBytes(mapPath, bytes);
+        }
+
+        private static bool ReplaceAscii(byte[] bytes, string oldValue, string newValue)
+        {
+            if (oldValue.Length != newValue.Length)
+                throw new ArgumentException("Replacement values must have the same length.");
+
+            var oldBytes = Encoding.ASCII.GetBytes(oldValue);
+            var newBytes = Encoding.ASCII.GetBytes(newValue);
+            var replaced = false;
+
+            for (var i = 0; i <= bytes.Length - oldBytes.Length; i++)
+            {
+                var matches = true;
+                for (var j = 0; j < oldBytes.Length; j++)
+                {
+                    if (bytes[i + j] == oldBytes[j])
+                        continue;
+
+                    matches = false;
+                    break;
+                }
+
+                if (!matches)
+                    continue;
+
+                Buffer.BlockCopy(newBytes, 0, bytes, i, newBytes.Length);
+                replaced = true;
+                i += oldBytes.Length - 1;
+            }
+
+            return replaced;
         }
 
         private static string? CopyReturnArtifact(string? destinationDirectory, string? sourcePath)
@@ -515,9 +626,10 @@ namespace StripValidationReplay
             return $"{stem}.uncompressed{ext}";
         }
 
-        private static void ForceUncompressed(object settings)
+        private static void ForceUncompressed<[DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicProperties)] TSettings>(TSettings settings)
+            where TSettings : notnull
         {
-            var t = settings.GetType();
+            var t = typeof(TSettings);
             foreach (var p in t.GetProperties(BindingFlags.Public | BindingFlags.Instance))
             {
                 if (!p.CanWrite) continue;
@@ -540,8 +652,16 @@ namespace StripValidationReplay
             string? NoteArgument,
             string? ReturnMapDirectory,
             string? ReturnGhostDirectory,
-            string? ReturnReplayDirectory
+            string? ReturnReplayDirectory,
+            CloneHandling CloneHandling
         );
+
+        private enum CloneHandling
+        {
+            Block,
+            RemoveCloneState,
+            KeepCloneState
+        }
 
         private sealed class CliArgumentException : Exception
         {
