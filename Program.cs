@@ -413,6 +413,9 @@ namespace StripValidationReplay
             Directory.CreateDirectory(fullDirectory);
 
             var destinationPath = Path.Combine(fullDirectory, Path.GetFileName(sourcePath));
+            if (Path.GetFullPath(sourcePath).Equals(Path.GetFullPath(destinationPath), StringComparison.OrdinalIgnoreCase))
+                return destinationPath;
+
             File.Copy(sourcePath, destinationPath, overwrite: true);
             return destinationPath;
         }
